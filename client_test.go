@@ -13,7 +13,7 @@ import (
 )
 
 func TestDialUDP(t *testing.T) {
-	HandleFunc("miek.nl.", HelloServer)
+	HandleFunc("1miek.nl.", HelloServer)
 	defer HandleRemove("miek.nl.")
 
 	s, addrstr, err := RunLocalUDPServer(":0")
