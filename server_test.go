@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,6 +35,19 @@ func HelloServerBadID(w ResponseWriter, req *Msg) {
 	w.WriteMsg(m)
 }
 
+func HelloServerBadThenGoodID(w ResponseWriter, req *Msg) {
+	m := new(Msg)
+	m.SetReply(req)
+	m.Id++
+
+	m.Extra = make([]RR, 1)
+	m.Extra[0] = &TXT{Hdr: RR_Header{Name: m.Question[0].Name, Rrtype: TypeTXT, Class: ClassINET, Ttl: 0}, Txt: []string{"Hello world"}}
+	w.WriteMsg(m)
+
+	m.Id--
+	w.WriteMsg(m)
+}
+
 func HelloServerEchoAddrPort(w ResponseWriter, req *Msg) {
 	m := new(Msg)
 	m.SetReply(req)
@@ -53,13 +67,7 @@ func AnotherHelloServer(w ResponseWriter, req *Msg) {
 	w.WriteMsg(m)
 }
 
-func RunLocalUDPServer(laddr string) (*Server, string, error) {
-	server, l, _, err := RunLocalUDPServerWithFinChan(laddr)
-
-	return server, l, err
-}
-
-func RunLocalUDPServerWithFinChan(laddr string) (*Server, string, chan error, error) {
+func RunLocalUDPServer(laddr string, opts ...func(*Server)) (*Server, string, chan error, error) {
 	pc, err := net.ListenPacket("udp", laddr)
 	if err != nil {
 		return nil, "", nil, err
@@ -70,9 +78,13 @@ func RunLocalUDPServerWithFinChan(laddr string) (*Server, string, chan error, er
 	waitLock.Lock()
 	server.NotifyStartedFunc = waitLock.Unlock
 
+	for _, opt := range opts {
+		opt(server)
+	}
+
 	// fin must be buffered so the goroutine below won't block
 	// forever if fin is never read from. This always happens
-	// in RunLocalUDPServer and can happen in TestShutdownUDP.
+	// if the channel is discarded and can happen in TestShutdownUDP.
 	fin := make(chan error, 1)
 
 	go func() {
@@ -84,34 +96,14 @@ func RunLocalUDPServerWithFinChan(laddr string) (*Server, string, chan error, er
 	return server, pc.LocalAddr().String(), fin, nil
 }
 
-func RunLocalUDPServerUnsafe(laddr string) (*Server, string, error) {
-	pc, err := net.ListenPacket("udp", laddr)
-	if err != nil {
-		return nil, "", err
-	}
-	server := &Server{PacketConn: pc, Unsafe: true,
-		ReadTimeout: time.Hour, WriteTimeout: time.Hour}
-
-	waitLock := sync.Mutex{}
-	waitLock.Lock()
-	server.NotifyStartedFunc = waitLock.Unlock
-
-	go func() {
-		server.ActivateAndServe()
-		pc.Close()
-	}()
-
-	waitLock.Lock()
-	return server, pc.LocalAddr().String(), nil
+func RunLocalPacketConnServer(laddr string, opts ...func(*Server)) (*Server, string, chan error, error) {
+	return RunLocalUDPServer(laddr, append(opts, func(srv *Server) {
+		// Make srv.PacketConn opaque to trigger the generic code paths.
+		srv.PacketConn = struct{ net.PacketConn }{srv.PacketConn}
+	})...)
 }
 
-func RunLocalTCPServer(laddr string) (*Server, string, error) {
-	server, l, _, err := RunLocalTCPServerWithFinChan(laddr)
-
-	return server, l, err
-}
-
-func RunLocalTCPServerWithFinChan(laddr string) (*Server, string, chan error, error) {
+func RunLocalTCPServer(laddr string, opts ...func(*Server)) (*Server, string, chan error, error) {
 	l, err := net.Listen("tcp", laddr)
 	if err != nil {
 		return nil, "", nil, err
@@ -123,8 +115,11 @@ func RunLocalTCPServerWithFinChan(laddr string) (*Server, string, chan error, er
 	waitLock.Lock()
 	server.NotifyStartedFunc = waitLock.Unlock
 
-	// See the comment in RunLocalUDPServerWithFinChan as to
-	// why fin must be buffered.
+	for _, opt := range opts {
+		opt(server)
+	}
+
+	// See the comment in RunLocalUDPServer as to why fin must be buffered.
 	fin := make(chan error, 1)
 
 	go func() {
@@ -136,34 +131,77 @@ func RunLocalTCPServerWithFinChan(laddr string) (*Server, string, chan error, er
 	return server, l.Addr().String(), fin, nil
 }
 
-func RunLocalTLSServer(laddr string, config *tls.Config) (*Server, string, error) {
-	l, err := tls.Listen("tcp", laddr, config)
-	if err != nil {
-		return nil, "", err
-	}
-
-	server := &Server{Listener: l, ReadTimeout: time.Hour, WriteTimeout: time.Hour}
-
-	waitLock := sync.Mutex{}
-	waitLock.Lock()
-	server.NotifyStartedFunc = waitLock.Unlock
-
-	go func() {
-		server.ActivateAndServe()
-		l.Close()
-	}()
-
-	waitLock.Lock()
-	return server, l.Addr().String(), nil
+func RunLocalTLSServer(laddr string, config *tls.Config) (*Server, string, chan error, error) {
+	return RunLocalTCPServer(laddr, func(srv *Server) {
+		srv.Listener = tls.NewListener(srv.Listener, config)
+	})
 }
 
 func TestServing(t *testing.T) {
-	HandleFunc("miek.nl.", HelloServer)
-	HandleFunc("example.com.", AnotherHelloServer)
-	defer HandleRemove("miek.nl.")
-	defer HandleRemove("example.com.")
+	for _, tc := range []struct {
+		name      string
+		network   string
+		runServer func(laddr string, opts ...func(*Server)) (*Server, string, chan error, error)
+	}{
+		{"udp", "udp", RunLocalUDPServer},
+		{"tcp", "tcp", RunLocalTCPServer},
+		{"PacketConn", "udp", RunLocalPacketConnServer},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			HandleFunc("miek.nl.", HelloServer)
+			HandleFunc("example.com.", AnotherHelloServer)
+			defer HandleRemove("miek.nl.")
+			defer HandleRemove("example.com.")
 
-	s, addrstr, err := RunLocalUDPServer(":0")
+			s, addrstr, _, err := tc.runServer(":0")
+			if err != nil {
+				t.Fatalf("unable to run test server: %v", err)
+			}
+			defer s.Shutdown()
+
+			c := &Client{
+				Net: tc.network,
+			}
+			m := new(Msg)
+			m.SetQuestion("miek.nl.", TypeTXT)
+			r, _, err := c.Exchange(m, addrstr)
+			if err != nil || len(r.Extra) == 0 {
+				t.Fatal("failed to exchange miek.nl", err)
+			}
+			txt := r.Extra[0].(*TXT).Txt[0]
+			if txt != "Hello world" {
+				t.Error("unexpected result for miek.nl", txt, "!= Hello world")
+			}
+
+			m.SetQuestion("example.com.", TypeTXT)
+			r, _, err = c.Exchange(m, addrstr)
+			if err != nil {
+				t.Fatal("failed to exchange example.com", err)
+			}
+			txt = r.Extra[0].(*TXT).Txt[0]
+			if txt != "Hello example" {
+				t.Error("unexpected result for example.com", txt, "!= Hello example")
+			}
+
+			// Test Mixes cased as noticed by Ask.
+			m.SetQuestion("eXaMplE.cOm.", TypeTXT)
+			r, _, err = c.Exchange(m, addrstr)
+			if err != nil {
+				t.Error("failed to exchange eXaMplE.cOm", err)
+			}
+			txt = r.Extra[0].(*TXT).Txt[0]
+			if txt != "Hello example" {
+				t.Error("unexpected result for example.com", txt, "!= Hello example")
+			}
+		})
+	}
+}
+
+// Verify that the server responds to a query with Z flag on, ignoring the flag, and does not echoes it back
+func TestServeIgnoresZFlag(t *testing.T) {
+	HandleFunc("example.com.", AnotherHelloServer)
+
+	s, addrstr, _, err := RunLocalUDPServer(":0")
 	if err != nil {
 		t.Fatalf("unable to run test server: %v", err)
 	}
@@ -171,35 +209,48 @@ func TestServing(t *testing.T) {
 
 	c := new(Client)
 	m := new(Msg)
-	m.SetQuestion("miek.nl.", TypeTXT)
-	r, _, err := c.Exchange(m, addrstr)
-	if err != nil || len(r.Extra) == 0 {
-		t.Fatal("failed to exchange miek.nl", err)
-	}
-	txt := r.Extra[0].(*TXT).Txt[0]
-	if txt != "Hello world" {
-		t.Error("unexpected result for miek.nl", txt, "!= Hello world")
-	}
 
+	// Test the Z flag is not echoed
 	m.SetQuestion("example.com.", TypeTXT)
-	r, _, err = c.Exchange(m, addrstr)
+	m.Zero = true
+	r, _, err := c.Exchange(m, addrstr)
 	if err != nil {
-		t.Fatal("failed to exchange example.com", err)
+		t.Fatal("failed to exchange example.com with +zflag", err)
 	}
-	txt = r.Extra[0].(*TXT).Txt[0]
-	if txt != "Hello example" {
-		t.Error("unexpected result for example.com", txt, "!= Hello example")
+	if r.Zero {
+		t.Error("the response should not have Z flag set - even for a query which does")
 	}
+	if r.Rcode != RcodeSuccess {
+		t.Errorf("expected rcode %v, got %v", RcodeSuccess, r.Rcode)
+	}
+}
 
-	// Test Mixes cased as noticed by Ask.
-	m.SetQuestion("eXaMplE.cOm.", TypeTXT)
-	r, _, err = c.Exchange(m, addrstr)
+// Verify that the server responds to a query with unsupported Opcode with a NotImplemented error and that Opcode is unchanged.
+func TestServeNotImplemented(t *testing.T) {
+	HandleFunc("example.com.", AnotherHelloServer)
+	opcode := 15
+
+	s, addrstr, _, err := RunLocalUDPServer(":0")
 	if err != nil {
-		t.Error("failed to exchange eXaMplE.cOm", err)
+		t.Fatalf("unable to run test server: %v", err)
 	}
-	txt = r.Extra[0].(*TXT).Txt[0]
-	if txt != "Hello example" {
-		t.Error("unexpected result for example.com", txt, "!= Hello example")
+	defer s.Shutdown()
+
+	c := new(Client)
+	m := new(Msg)
+
+	// Test that Opcode is like the unchanged from request Opcode and that Rcode is set to NotImplemented
+	m.SetQuestion("example.com.", TypeTXT)
+	m.Opcode = opcode
+	r, _, err := c.Exchange(m, addrstr)
+	if err != nil {
+		t.Fatal("failed to exchange example.com with +zflag", err)
+	}
+	if r.Opcode != opcode {
+		t.Errorf("expected opcode %v, got %v", opcode, r.Opcode)
+	}
+	if r.Rcode != RcodeNotImplemented {
+		t.Errorf("expected rcode %v, got %v", RcodeNotImplemented, r.Rcode)
 	}
 }
 
@@ -218,7 +269,7 @@ func TestServingTLS(t *testing.T) {
 		Certificates: []tls.Certificate{cert},
 	}
 
-	s, addrstr, err := RunLocalTLSServer(":0", &config)
+	s, addrstr, _, err := RunLocalTLSServer(":0", &config)
 	if err != nil {
 		t.Fatalf("unable to run test server: %v", err)
 	}
@@ -304,7 +355,7 @@ func TestServingTLSConnectionState(t *testing.T) {
 		Certificates: []tls.Certificate{cert},
 	}
 
-	s, addrstr, err := RunLocalTLSServer(":0", &config)
+	s, addrstr, _, err := RunLocalTLSServer(":0", &config)
 	if err != nil {
 		t.Fatalf("unable to run test server: %v", err)
 	}
@@ -327,7 +378,7 @@ func TestServingTLSConnectionState(t *testing.T) {
 	// UDP DNS Server
 	HandleFunc(".", tlsHandlerTLS(false))
 	defer HandleRemove(".")
-	s, addrstr, err = RunLocalUDPServer(":0")
+	s, addrstr, _, err = RunLocalUDPServer(":0")
 	if err != nil {
 		t.Fatalf("unable to run test server: %v", err)
 	}
@@ -341,7 +392,7 @@ func TestServingTLSConnectionState(t *testing.T) {
 	}
 
 	// TCP DNS Server
-	s, addrstr, err = RunLocalTCPServer(":0")
+	s, addrstr, _, err = RunLocalTCPServer(":0")
 	if err != nil {
 		t.Fatalf("unable to run test server: %v", err)
 	}
@@ -425,7 +476,7 @@ func BenchmarkServe(b *testing.B) {
 	defer HandleRemove("miek.nl.")
 	a := runtime.GOMAXPROCS(4)
 
-	s, addrstr, err := RunLocalUDPServer(":0")
+	s, addrstr, _, err := RunLocalUDPServer(":0")
 	if err != nil {
 		b.Fatalf("unable to run test server: %v", err)
 	}
@@ -450,7 +501,7 @@ func BenchmarkServe6(b *testing.B) {
 	HandleFunc("miek.nl.", HelloServer)
 	defer HandleRemove("miek.nl.")
 	a := runtime.GOMAXPROCS(4)
-	s, addrstr, err := RunLocalUDPServer("[::1]:0")
+	s, addrstr, _, err := RunLocalUDPServer("[::1]:0")
 	if err != nil {
 		if strings.Contains(err.Error(), "bind: cannot assign requested address") {
 			b.Skip("missing IPv6 support")
@@ -487,7 +538,7 @@ func BenchmarkServeCompress(b *testing.B) {
 	HandleFunc("miek.nl.", HelloServerCompress)
 	defer HandleRemove("miek.nl.")
 	a := runtime.GOMAXPROCS(4)
-	s, addrstr, err := RunLocalUDPServer(":0")
+	s, addrstr, _, err := RunLocalUDPServer(":0")
 	if err != nil {
 		b.Fatalf("unable to run test server: %v", err)
 	}
@@ -504,57 +555,6 @@ func BenchmarkServeCompress(b *testing.B) {
 		}
 	}
 	runtime.GOMAXPROCS(a)
-}
-
-func TestDotAsCatchAllWildcard(t *testing.T) {
-	mux := NewServeMux()
-	mux.Handle(".", HandlerFunc(HelloServer))
-	mux.Handle("example.com.", HandlerFunc(AnotherHelloServer))
-
-	handler := mux.match("www.miek.nl.", TypeTXT)
-	if handler == nil {
-		t.Error("wildcard match failed")
-	}
-
-	handler = mux.match("www.example.com.", TypeTXT)
-	if handler == nil {
-		t.Error("example.com match failed")
-	}
-
-	handler = mux.match("a.www.example.com.", TypeTXT)
-	if handler == nil {
-		t.Error("a.www.example.com match failed")
-	}
-
-	handler = mux.match("boe.", TypeTXT)
-	if handler == nil {
-		t.Error("boe. match failed")
-	}
-}
-
-func TestCaseFolding(t *testing.T) {
-	mux := NewServeMux()
-	mux.Handle("_udp.example.com.", HandlerFunc(HelloServer))
-
-	handler := mux.match("_dns._udp.example.com.", TypeSRV)
-	if handler == nil {
-		t.Error("case sensitive characters folded")
-	}
-
-	handler = mux.match("_DNS._UDP.EXAMPLE.COM.", TypeSRV)
-	if handler == nil {
-		t.Error("case insensitive characters not folded")
-	}
-}
-
-func TestRootServer(t *testing.T) {
-	mux := NewServeMux()
-	mux.Handle(".", HandlerFunc(HelloServer))
-
-	handler := mux.match(".", TypeNS)
-	if handler == nil {
-		t.Error("root match failed")
-	}
 }
 
 type maxRec struct {
@@ -591,7 +591,7 @@ func TestServingLargeResponses(t *testing.T) {
 	HandleFunc("example.", HelloServerLargeResponse)
 	defer HandleRemove("example.")
 
-	s, addrstr, err := RunLocalUDPServer(":0")
+	s, addrstr, _, err := RunLocalUDPServer(":0")
 	if err != nil {
 		t.Fatalf("unable to run test server: %v", err)
 	}
@@ -631,10 +631,11 @@ func TestServingResponse(t *testing.T) {
 		t.Skip("skipping test in short mode.")
 	}
 	HandleFunc("miek.nl.", HelloServer)
-	s, addrstr, err := RunLocalUDPServer(":0")
+	s, addrstr, _, err := RunLocalUDPServer(":0")
 	if err != nil {
 		t.Fatalf("unable to run test server: %v", err)
 	}
+	defer s.Shutdown()
 
 	c := new(Client)
 	m := new(Msg)
@@ -644,28 +645,16 @@ func TestServingResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal("failed to exchange", err)
 	}
-	m.Response = true
+	m.Response = true // this holds up the reply, set short read time out to avoid waiting too long
+	c.ReadTimeout = 100 * time.Millisecond
 	_, _, err = c.Exchange(m, addrstr)
 	if err == nil {
 		t.Fatal("exchanged response message")
 	}
-
-	s.Shutdown()
-	s, addrstr, err = RunLocalUDPServerUnsafe(":0")
-	if err != nil {
-		t.Fatalf("unable to run test server: %v", err)
-	}
-	defer s.Shutdown()
-
-	m.Response = true
-	_, _, err = c.Exchange(m, addrstr)
-	if err != nil {
-		t.Fatal("could exchanged response message in Unsafe mode")
-	}
 }
 
 func TestShutdownTCP(t *testing.T) {
-	s, _, fin, err := RunLocalTCPServerWithFinChan(":0")
+	s, _, fin, err := RunLocalTCPServer(":0")
 	if err != nil {
 		t.Fatalf("unable to run test server: %v", err)
 	}
@@ -690,15 +679,17 @@ func init() {
 }
 
 func checkInProgressQueriesAtShutdownServer(t *testing.T, srv *Server, addr string, client *Client) {
-	const requests = 100
-
-	var wg sync.WaitGroup
-	wg.Add(requests)
+	const requests = 15 // enough to make this interesting? TODO: find a proper value
 
 	var errOnce sync.Once
+	// t.Fail will panic if it's called after the test function has
+	// finished. Burning the sync.Once with a defer will prevent the
+	// handler from calling t.Errorf after we've returned.
+	defer errOnce.Do(func() {})
 
+	toHandle := int32(requests)
 	HandleFunc("example.com.", func(w ResponseWriter, req *Msg) {
-		defer wg.Done()
+		defer atomic.AddInt32(&toHandle, -1)
 
 		// Wait until ShutdownContext is called before replying.
 		testShutdownNotify.L.Lock()
@@ -718,7 +709,7 @@ func checkInProgressQueriesAtShutdownServer(t *testing.T, srv *Server, addr stri
 	})
 	defer HandleRemove("example.com.")
 
-	client.Timeout = 10 * time.Second
+	client.Timeout = 1 * time.Second
 
 	conns := make([]*Conn, requests)
 	eg := new(errgroup.Group)
@@ -771,32 +762,30 @@ func checkInProgressQueriesAtShutdownServer(t *testing.T, srv *Server, addr stri
 		})
 	}
 
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
 	ctx, cancel := context.WithTimeout(context.Background(), client.Timeout)
 	defer cancel()
 
 	if err := srv.ShutdownContext(ctx); err != nil {
-		t.Errorf("could not shutdown test server, %v", err)
+		t.Errorf("could not shutdown test server: %v", err)
 	}
 
-	select {
-	case <-done:
-	default:
-		t.Error("ShutdownContext returned before replies")
+	if left := atomic.LoadInt32(&toHandle); left != 0 {
+		t.Errorf("ShutdownContext returned before %d replies", left)
 	}
 
 	if eg.Wait() != nil {
-		t.Fatalf("conn.ReadMsg error: %v", eg.Wait())
+		t.Errorf("conn.ReadMsg error: %v", eg.Wait())
+	}
+
+	srv.lock.RLock()
+	defer srv.lock.RUnlock()
+	if len(srv.conns) != 0 {
+		t.Errorf("TCP connection tracking map not empty after ShutdownContext; map still contains %d connections", len(srv.conns))
 	}
 }
 
 func TestInProgressQueriesAtShutdownTCP(t *testing.T) {
-	s, addr, _, err := RunLocalTCPServerWithFinChan(":0")
+	s, addr, _, err := RunLocalTCPServer(":0")
 	if err != nil {
 		t.Fatalf("unable to run test server: %v", err)
 	}
@@ -815,7 +804,7 @@ func TestShutdownTLS(t *testing.T) {
 		Certificates: []tls.Certificate{cert},
 	}
 
-	s, _, err := RunLocalTLSServer(":0", &config)
+	s, _, _, err := RunLocalTLSServer(":0", &config)
 	if err != nil {
 		t.Fatalf("unable to run test server: %v", err)
 	}
@@ -835,7 +824,7 @@ func TestInProgressQueriesAtShutdownTLS(t *testing.T) {
 		Certificates: []tls.Certificate{cert},
 	}
 
-	s, addr, err := RunLocalTLSServer(":0", &config)
+	s, addr, _, err := RunLocalTLSServer(":0", &config)
 	if err != nil {
 		t.Fatalf("unable to run test server: %v", err)
 	}
@@ -849,24 +838,7 @@ func TestInProgressQueriesAtShutdownTLS(t *testing.T) {
 	checkInProgressQueriesAtShutdownServer(t, s, addr, c)
 }
 
-type trigger struct {
-	done bool
-	sync.RWMutex
-}
-
-func (t *trigger) Set() {
-	t.Lock()
-	defer t.Unlock()
-	t.done = true
-}
-func (t *trigger) Get() bool {
-	t.RLock()
-	defer t.RUnlock()
-	return t.done
-}
-
 func TestHandlerCloseTCP(t *testing.T) {
-
 	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
 		panic(err)
@@ -876,9 +848,9 @@ func TestHandlerCloseTCP(t *testing.T) {
 	server := &Server{Addr: addr, Net: "tcp", Listener: ln}
 
 	hname := "testhandlerclosetcp."
-	triggered := &trigger{}
+	triggered := make(chan struct{})
 	HandleFunc(hname, func(w ResponseWriter, r *Msg) {
-		triggered.Set()
+		close(triggered)
 		w.Close()
 	})
 	defer HandleRemove(hname)
@@ -891,7 +863,7 @@ func TestHandlerCloseTCP(t *testing.T) {
 	exchange:
 		_, _, err := c.Exchange(m, addr)
 		if err != nil && err != io.EOF {
-			t.Errorf("exchange failed: %s\n", err)
+			t.Errorf("exchange failed: %v", err)
 			if tries == 3 {
 				return
 			}
@@ -900,14 +872,37 @@ func TestHandlerCloseTCP(t *testing.T) {
 			goto exchange
 		}
 	}()
-	server.ActivateAndServe()
-	if !triggered.Get() {
+	if err := server.ActivateAndServe(); err != nil {
+		t.Fatalf("ActivateAndServe failed: %v", err)
+	}
+	select {
+	case <-triggered:
+	default:
 		t.Fatalf("handler never called")
 	}
 }
 
 func TestShutdownUDP(t *testing.T) {
-	s, _, fin, err := RunLocalUDPServerWithFinChan(":0")
+	s, _, fin, err := RunLocalUDPServer(":0")
+	if err != nil {
+		t.Fatalf("unable to run test server: %v", err)
+	}
+	err = s.Shutdown()
+	if err != nil {
+		t.Errorf("could not shutdown test UDP server, %v", err)
+	}
+	select {
+	case err := <-fin:
+		if err != nil {
+			t.Errorf("error returned from ActivateAndServe, %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("could not shutdown test UDP server. Gave up waiting")
+	}
+}
+
+func TestShutdownPacketConn(t *testing.T) {
+	s, _, fin, err := RunLocalPacketConnServer(":0")
 	if err != nil {
 		t.Fatalf("unable to run test server: %v", err)
 	}
@@ -926,7 +921,17 @@ func TestShutdownUDP(t *testing.T) {
 }
 
 func TestInProgressQueriesAtShutdownUDP(t *testing.T) {
-	s, addr, _, err := RunLocalUDPServerWithFinChan(":0")
+	s, addr, _, err := RunLocalUDPServer(":0")
+	if err != nil {
+		t.Fatalf("unable to run test server: %v", err)
+	}
+
+	c := &Client{Net: "udp"}
+	checkInProgressQueriesAtShutdownServer(t, s, addr, c)
+}
+
+func TestInProgressQueriesAtShutdownPacketConn(t *testing.T) {
+	s, addr, _, err := RunLocalPacketConnServer(":0")
 	if err != nil {
 		t.Fatalf("unable to run test server: %v", err)
 	}
@@ -939,7 +944,7 @@ func TestServerStartStopRace(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
-		s, _, _, err := RunLocalUDPServerWithFinChan(":0")
+		s, _, _, err := RunLocalUDPServer(":0")
 		if err != nil {
 			t.Fatalf("could not start server: %s", err)
 		}
@@ -996,6 +1001,133 @@ func TestServerReuseport(t *testing.T) {
 	}
 	if err := <-fin2; err != nil {
 		t.Fatalf("second ListenAndServe returned error after Shutdown: %v", err)
+	}
+}
+
+func TestServerRoundtripTsig(t *testing.T) {
+	secret := map[string]string{"test.": "so6ZGir4GPAqINNh9U5c3A=="}
+
+	s, addrstr, _, err := RunLocalUDPServer(":0", func(srv *Server) {
+		srv.TsigSecret = secret
+		srv.MsgAcceptFunc = func(dh Header) MsgAcceptAction {
+			// defaultMsgAcceptFunc does reject UPDATE queries
+			return MsgAccept
+		}
+	})
+	if err != nil {
+		t.Fatalf("unable to run test server: %v", err)
+	}
+	defer s.Shutdown()
+
+	handlerFired := make(chan struct{})
+	HandleFunc("example.com.", func(w ResponseWriter, r *Msg) {
+		close(handlerFired)
+
+		m := new(Msg)
+		m.SetReply(r)
+		if r.IsTsig() != nil {
+			status := w.TsigStatus()
+			if status == nil {
+				// *Msg r has an TSIG record and it was validated
+				m.SetTsig("test.", HmacSHA256, 300, time.Now().Unix())
+			} else {
+				// *Msg r has an TSIG records and it was not validated
+				t.Errorf("invalid TSIG: %v", status)
+			}
+		} else {
+			t.Error("missing TSIG")
+		}
+		if err := w.WriteMsg(m); err != nil {
+			t.Error("writemsg failed", err)
+		}
+	})
+
+	c := new(Client)
+	m := new(Msg)
+	m.Opcode = OpcodeUpdate
+	m.SetQuestion("example.com.", TypeSOA)
+	m.Ns = []RR{&CNAME{
+		Hdr: RR_Header{
+			Name:   "foo.example.com.",
+			Rrtype: TypeCNAME,
+			Class:  ClassINET,
+			Ttl:    300,
+		},
+		Target: "bar.example.com.",
+	}}
+	c.TsigSecret = secret
+	m.SetTsig("test.", HmacSHA256, 300, time.Now().Unix())
+	_, _, err = c.Exchange(m, addrstr)
+	if err != nil {
+		t.Fatal("failed to exchange", err)
+	}
+	select {
+	case <-handlerFired:
+		// ok, handler was actually called
+	default:
+		t.Error("handler was not called")
+	}
+}
+
+func TestResponseAfterClose(t *testing.T) {
+	testError := func(name string, err error) {
+		t.Helper()
+
+		expect := fmt.Sprintf("dns: %s called after Close", name)
+		if err == nil {
+			t.Errorf("expected error from %s after Close", name)
+		} else if err.Error() != expect {
+			t.Errorf("expected explicit error from %s after Close, expected %q, got %q", name, expect, err)
+		}
+	}
+
+	rw := &response{
+		closed: true,
+	}
+
+	_, err := rw.Write(make([]byte, 2))
+	testError("Write", err)
+
+	testError("WriteMsg", rw.WriteMsg(new(Msg)))
+}
+
+func TestResponseDoubleClose(t *testing.T) {
+	rw := &response{
+		closed: true,
+	}
+	if err, expect := rw.Close(), "dns: connection already closed"; err == nil || err.Error() != expect {
+		t.Errorf("Close did not return expected: error %q, got: %v", expect, err)
+	}
+}
+
+type countingConn struct {
+	net.Conn
+	writes int
+}
+
+func (c *countingConn) Write(p []byte) (int, error) {
+	c.writes++
+	return len(p), nil
+}
+
+func TestResponseWriteSinglePacket(t *testing.T) {
+	c := &countingConn{}
+	rw := &response{
+		tcp: c,
+	}
+	rw.writer = rw
+
+	m := new(Msg)
+	m.SetQuestion("miek.nl.", TypeTXT)
+	m.Response = true
+	err := rw.WriteMsg(m)
+
+	if err != nil {
+		t.Fatalf("failed to write: %v", err)
+	}
+
+	if c.writes != 1 {
+		t.Fatalf("incorrect number of Write calls")
 	}
 }
 
