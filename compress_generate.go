@@ -1,4 +1,5 @@
-//+build ignore
+//go:build ignore
+// +build ignore
 
 // compression_generate.go is meant to run with go generate. It will use
 // go/{importer,types} to track down all the RR struct types. Then for each type
@@ -46,7 +47,7 @@ func getTypeStruct(t types.Type, scope *types.Scope) (*types.Struct, bool) {
 
 func main() {
 	// Import and type-check the package
-	pkg, err := importer.Default().Import("github.com/miekg/dns")
+	pkg, err := importer.Default().Import("github.com/Intrising/dns")
 	fatalIfErr(err)
 	scope := pkg.Scope()
 

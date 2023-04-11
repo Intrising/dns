@@ -1,4 +1,5 @@
-module github.com/miekg/dns
+// This repo is forked from  github.com/miekg/dns
+module github.com/Intrising/dns
 
 go 1.14
 
