@@ -1,5 +1,4 @@
-//go:build ignore
-// +build ignore
+//+build ignore
 
 // types_generate.go is meant to run with go generate. It will use
 // go/{importer,types} to track down all the RR struct types. Then for each type
@@ -56,7 +55,7 @@ func loadModule(name string) (*types.Package, error) {
 
 func main() {
 	// Import and type-check the package
-	pkg, err := loadModule("github.com/Intrising/dns")
+	pkg, err := loadModule("github.com/miekg/dns")
 	fatalIfErr(err)
 	scope := pkg.Scope()
 
